@@ -102,6 +102,7 @@
 #endif
 
 #ifdef CONFIG_AIRPLAY_2
+#include "ap2_apat.h"
 #include "ap2_buffered_audio_processor.h"
 #include "ptp-utilities.h"
 #endif
@@ -443,6 +444,7 @@ int ssrc_is_recognised(ssrc_t ssrc) {
   case AAC_48000_F24_2:
   case AAC_48000_F24_5P1:
   case AAC_48000_F24_7P1:
+  case AAC_ELD_48000_F24_2:
     response = 1;
     break;
   default:
@@ -488,6 +490,9 @@ const char *get_ssrc_name(ssrc_t ssrc) {
   case AAC_48000_F24_7P1:
     response = "AAC/48000/F24/7.1";
     break;
+  case AAC_ELD_48000_F24_2:
+    response = "AAC-ELD/48000/F24/2";
+    break;
   case SSRC_NONE:
     response = "SSRC_NONE";
     break;
@@ -510,6 +515,7 @@ uint32_t get_ssrc_rate(ssrc_t ssrc) {
   case AAC_48000_F24_2:
   case AAC_48000_F24_5P1:
   case AAC_48000_F24_7P1:
+  case AAC_ELD_48000_F24_2:
     response = 48000;
     break;
   default:
@@ -530,6 +536,9 @@ size_t get_ssrc_block_length(ssrc_t ssrc) {
   case AAC_48000_F24_5P1:
   case AAC_48000_F24_7P1:
     response = 1024;
+    break;
+  case AAC_ELD_48000_F24_2:
+    response = 480;
     break;
   default:
     break;
@@ -580,6 +589,9 @@ int setup_software_resampler(rtsp_conn_info *conn, ssrc_t ssrc) {
     break;
   case AAC_48000_F24_7P1:
     channels = 8;
+    break;
+  case AAC_ELD_48000_F24_2:
+    conn->frames_per_packet = 480;
     break;
   default:
     debug(1, "Can't set rate for %s.", get_ssrc_name(ssrc));
@@ -654,7 +666,8 @@ int setup_software_resampler(rtsp_conn_info *conn, ssrc_t ssrc) {
       input_format = conn->codec_context->sample_fmt;
     } break;
     case AAC_44100_F24_2:
-    case AAC_48000_F24_2: {
+    case AAC_48000_F24_2:
+    case AAC_ELD_48000_F24_2: {
       // defaults are fine...
     } break;
     case AAC_48000_F24_5P1: {
@@ -1055,6 +1068,16 @@ int setup_software_resampler(rtsp_conn_info *conn, ssrc_t ssrc) {
   }
   return response; // 0 if everything is okay
 }
+double backend_buffer_desired_length(rtsp_conn_info *conn) {
+#ifdef CONFIG_AIRPLAY_2
+  if (conn->low_latency_stream != 0)
+    return config.low_latency_audio_backend_buffer_desired_length;
+#else
+  (void)conn;
+#endif
+  return config.audio_backend_buffer_desired_length;
+}
+
 void prepare_decoding_chain(rtsp_conn_info *conn, ssrc_t ssrc) {
   if ((ssrc != SSRC_NONE) && (ssrc != conn->incoming_ssrc) && (ssrc_is_recognised(ssrc) != 0)) {
     // conn->incoming_ssrc will be SSRC_NONE only before the first valid encoding is found
@@ -1102,6 +1125,7 @@ void prepare_decoding_chain(rtsp_conn_info *conn, ssrc_t ssrc) {
       case AAC_48000_F24_2:
       case AAC_48000_F24_5P1:
       case AAC_48000_F24_7P1:
+      case AAC_ELD_48000_F24_2:
         conn->codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
         break;
       default:
@@ -1156,6 +1180,19 @@ void prepare_decoding_chain(rtsp_conn_info *conn, ssrc_t ssrc) {
           extradata->alac_config.maxRun = htons(255);
           conn->codec_context->extradata = (uint8_t *)extradata;
           conn->codec_context->extradata_size = sizeof(alac_ffmpeg_magic_cookie);
+        } else if (ssrc == AAC_ELD_48000_F24_2) {
+          // AAC-ELD can't be described by an ADTS header, so the decoder gets the
+          // AudioSpecificConfig instead: AOT 39 (ER AAC ELD), 48 kHz, 2 channels, 480-frame packets
+          static const uint8_t eld_audio_specific_config[] = {0xF8, 0xE6, 0x50, 0x00};
+          // avcodec_free_context() frees the extradata, so it must come from av_malloc
+          uint8_t *extradata =
+              av_mallocz(sizeof(eld_audio_specific_config) + AV_INPUT_BUFFER_PADDING_SIZE);
+          if (extradata == NULL)
+            die("connection %d: could not allocate memory for the AAC-ELD configuration.",
+                conn->connection_number);
+          memcpy(extradata, eld_audio_specific_config, sizeof(eld_audio_specific_config));
+          conn->codec_context->extradata = extradata;
+          conn->codec_context->extradata_size = sizeof(eld_audio_specific_config);
         } else {
           conn->codec_context->extradata = NULL;
         }
@@ -1174,11 +1211,7 @@ void prepare_decoding_chain(rtsp_conn_info *conn, ssrc_t ssrc) {
       conn->input_rate = get_ssrc_rate(ssrc);
       debug(2, "Connection %d: set conn->input_rate: %u.", conn->connection_number,
             conn->input_rate);
-      if ((ssrc == ALAC_48000_S24_2) || (ssrc == ALAC_44100_S16_2)) {
-        conn->frames_per_packet = 352;
-      } else {
-        conn->frames_per_packet = 1024;
-      }
+      conn->frames_per_packet = get_ssrc_block_length(ssrc); // 352 for ALAC, 1024 or 480 for AAC
       conn->codec_context->sample_rate = conn->input_rate;
       conn->ffmpeg_decoding_chain_initialised = 1;
       conn->input_format_is_valid = 1;
@@ -1315,7 +1348,10 @@ AVFrame *block_to_avframe(rtsp_conn_info *conn, uint8_t *incoming_data,
                           size_t incoming_data_length) {
 
   AVFrame *decoded_frame = NULL;
-  if (incoming_data_length > 8) {
+  // AAC-ELD codes silence in three or four bytes, and every packet must reach the decoder to keep
+  // its state continuous
+  size_t minimum_length = (conn->incoming_ssrc == AAC_ELD_48000_F24_2) ? 0 : 8;
+  if (incoming_data_length > minimum_length) {
     int oldState;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState); // make this un-cancellable
     AVPacket *pkt = av_packet_alloc();
@@ -1770,7 +1806,7 @@ uint32_t player_put_packet(uint32_t ssrc, seq_t seqno, uint32_t actual_timestamp
     uint64_t resend_repeat_interval =
         (uint64_t)(config.resend_control_check_interval_time * (uint64_t)1000000000);
     uint64_t minimum_remaining_time = (uint64_t)((config.resend_control_last_check_time +
-                                                  config.audio_backend_buffer_desired_length) *
+                                                  backend_buffer_desired_length(conn)) *
                                                  (uint64_t)1000000000);
     uint64_t latency_time = (uint64_t)(conn->latency * (uint64_t)1000000000);
     latency_time = latency_time / (uint64_t)conn->input_rate;
@@ -2742,7 +2778,7 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
           // audio buffer to be filled to the desired length
 
           uint32_t desired_buffer_latency =
-              (uint32_t)(config.audio_backend_buffer_desired_length * conn->input_rate);
+              (uint32_t)(backend_buffer_desired_length(conn) * conn->input_rate);
           frame_to_local_time(curframe->timestamp - desired_buffer_latency, &time_to_play, conn);
           uint64_t current_buffer_delay = 0;
           int resp = -1;
@@ -2820,6 +2856,17 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
         time_to_wait_for_wakeup_ns *=
             4 * conn->frames_per_packet; // about 4 * 7 mS for 352 frames per second
       }
+#ifdef CONFIG_AIRPLAY_2
+      // A low-latency stream keeps only a short buffer in the backend (30 ms by default), less
+      // than four of its packets (40 ms of AAC-ELD): sleeping that long lets the backend run dry
+      // whenever packets pause. Wake at least three times per backend buffer.
+      if (conn->low_latency_stream != 0) {
+        uint64_t a_third_of_the_backend_buffer_ns =
+            (uint64_t)(backend_buffer_desired_length(conn) * 1000000000.0 / 3);
+        if (time_to_wait_for_wakeup_ns > a_third_of_the_backend_buffer_ns)
+          time_to_wait_for_wakeup_ns = a_third_of_the_backend_buffer_ns;
+      }
+#endif
 
 #ifdef COMPILE_FOR_LINUX_AND_FREEBSD_AND_CYGWIN_AND_OPENBSD
       uint64_t time_of_wakeup_ns = get_realtime_in_ns() + time_to_wait_for_wakeup_ns;
@@ -3433,6 +3480,7 @@ static void send_classic_stream_description(const char *type, rtsp_conn_info *co
 void player_thread_cleanup_handler(void *arg) {
   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
   // debug(1, "Connection %d: player_thread_cleanup_handler start.", conn->connection_number);
+  __atomic_store_n(&conn->player_thread_ready, 0, __ATOMIC_RELEASE);
 
   if (config.output->stop) {
 #ifdef CONFIG_FFMPEG
@@ -3483,7 +3531,10 @@ void player_thread_cleanup_handler(void *arg) {
 #ifdef CONFIG_AIRPLAY_2
   if (conn->airplay_type == ap_2) {
     debug(2, "Cancelling AP2 timing, control and audio threads...");
-    if (conn->airplay_stream_type == realtime_stream) {
+    if (conn->ap2_apat != NULL) {
+      debug(3, "Connection %d: stop the low-latency stream", conn->connection_number);
+      ap2_apat_stop(conn);
+    } else if (conn->airplay_stream_type == realtime_stream) {
       debug(2, "Connection %d: Delete Realtime Audio Stream thread", conn->connection_number);
       pthread_cancel(conn->rtp_realtime_audio_thread);
       pthread_join(conn->rtp_realtime_audio_thread, NULL);
@@ -3528,7 +3579,8 @@ void player_thread_cleanup_handler(void *arg) {
 
 #ifdef CONFIG_AIRPLAY_2
   }
-  ptp_send_control_message_string("E");
+  if (conn->ptp_session_timing == 0) // otherwise the session's end sends it (rtsp.c)
+    ptp_send_control_message_string("E");
 #endif
 
 #ifdef CONFIG_METADATA
@@ -3583,6 +3635,12 @@ void player_thread_cleanup_handler(void *arg) {
 
 void *player_thread_func(void *arg) {
   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+#ifdef CONFIG_AIRPLAY_2
+  // A low-latency stream's backend buffer is short (30 ms): this thread, which fills it, must not
+  // be held back by ordinary threads where real-time scheduling is refused (Android).
+  if (conn->low_latency_stream != 0)
+    ap2_apat_audio_thread_priority(-19);
+#endif
 #ifdef CONFIG_METADATA
   uint64_t time_of_last_metadata_progress_update =
       0; // the assignment is to stop a compiler warning...
@@ -3807,6 +3865,9 @@ void *player_thread_func(void *arg) {
 #endif
 
   pthread_cleanup_push(player_thread_cleanup_handler, arg); // undo what's been done so far
+
+  // The buffers and the play state are initialised: audio may now be put into the buffer.
+  __atomic_store_n(&conn->player_thread_ready, 1, __ATOMIC_RELEASE);
 
   // stop looking elsewhere for DACP stuff
   int oldState;
@@ -5507,6 +5568,7 @@ int player_play(rtsp_conn_info *conn) {
 
   pthread_mutex_lock_and_cleanup_push(&conn->player_create_delete_mutex);
   if (conn->player_thread == NULL) {
+    __atomic_store_n(&conn->player_thread_ready, 0, __ATOMIC_RELEASE);
     pthread_t *pt = malloc(sizeof(pthread_t));
     if (pt == NULL)
       die("Couldn't allocate space for pthread_t");
@@ -5521,6 +5583,21 @@ int player_play(rtsp_conn_info *conn) {
     debug(1, "Connection %d: player thread already exists.", conn->connection_number);
   }
   pthread_cleanup_pop(1); // release the player_create_delete_mutex
+#ifdef CONFIG_AIRPLAY_2
+  if (config.airplay_2_low_latency_mode != 0) {
+    // The sender's anchor time can come within milliseconds of the SETUP reply, and the player
+    // thread's start-up clears the play state and the buffers. Wait (up to a second) until it
+    // has done that, so that neither an anchor nor audio can arrive before it.
+    int waited;
+    for (waited = 0;
+         (waited < 1000) && (__atomic_load_n(&conn->player_thread_ready, __ATOMIC_ACQUIRE) == 0);
+         waited++)
+      usleep(1000);
+    if (__atomic_load_n(&conn->player_thread_ready, __ATOMIC_ACQUIRE) == 0)
+      debug(1, "Connection %d: the player thread did not start within a second.",
+            conn->connection_number);
+  }
+#endif
 #ifdef CONFIG_METADATA
   send_ssnc_metadata('pbeg', NULL, 0, 1); // contains cancellation points
 #endif

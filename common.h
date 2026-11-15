@@ -404,6 +404,10 @@ typedef struct {
   unsigned int volumeControlType; // may be associated with different volume control arrangements
   int airplay_2_44100_only_mode; // some sources can't transcode 44.1 k to 48k and won't play
   int lossless_mode;        // sometimes there is an audible glitch doing dynamic switching AAC to ALAC.
+  uint64_t airplay_features_ex; // feature bits 64 to 127; they are advertised in the fex only
+  int airplay_2_low_latency_mode; // advertise and accept Apple's low-latency ("Realtime APAT") stream
+  double low_latency_audio_backend_buffer_desired_length; // used while a low-latency stream plays
+  int low_latency_output_active; // true while a low-latency stream plays; backends may read it
 #endif
 
   APST_t service_type; // APST_auto, APST_classic, APST_forced_classic, APST_airplay2

@@ -98,6 +98,8 @@
 #endif
 
 #ifdef CONFIG_AIRPLAY_2
+#include "ap2_apat.h"
+#include "ap2_apat_codec.h"
 #include "ap2_buffered_audio_processor.h"
 #include "ap2_event_receiver.h"
 #ifdef CONFIG_METADATA_HUB
@@ -597,6 +599,24 @@ void set_client_as_ptp_clock(rtsp_conn_info *conn) {
   strncat(timing_list_message, (const char *)&conn->client_ip_string,
           sizeof(timing_list_message) - 1 - strlen(timing_list_message));
   ptp_send_control_message_string(timing_list_message);
+}
+
+// In the low-latency mode NQPTP follows the sender's clock for the whole session, from its
+// SETPEERS on, as Apple's receivers do. Otherwise NQPTP is told of the sender's clock at each
+// stream's SETUP ("T", which clears the client's clock records) and of the end of play at each
+// stream's end ("E", after which the clock is taken as possibly stopped), and a stream's timing
+// is valid only once NQPTP has the clock again and it has been master for 400 ms (see rtp.c):
+// about half a second into every stream. A buffered stream's two seconds hide that; a low-latency
+// stream would lose the start of every sound, as the sender sets up a new stream for each sound
+// after a second of silence. "E" is sent when the session ends instead.
+static void follow_session_clock(rtsp_conn_info *conn) {
+  if ((config.airplay_2_low_latency_mode == 0) || (conn->ptp_session_timing != 0))
+    return;
+  set_client_as_ptp_clock(conn);
+  ptp_send_control_message_string("B"); // the clock is to be taken as running from now on
+  conn->ptp_session_timing = 1;
+  debug(2, "Connection %d: NQPTP follows the sender's clock for the session.",
+        conn->connection_number);
 }
 #endif
 
@@ -1219,6 +1239,14 @@ plist_t generateInfoPlist(rtsp_conn_info *conn) {
       // plist_dict_set_item(supported_formats_plist, "audioStream", plist_new_uint(21235712));
       plist_dict_set_item(supported_formats_plist, "audioStream",
                           plist_new_uint(262144)); // just ALAC/S16/2
+      if (config.airplay_2_low_latency_mode != 0) {
+        // A Mac's low-latency stream takes its format from these bufferStream formats, and it
+        // prefers AAC-ELD/48000/2 if it is among them; otherwise it falls back to ALAC/44100,
+        // which it does not keep sending on that stream. ("lowLatencyAudioStream" is not used
+        // for it: that key is for a different stream type.) The buffered stream can be sent in
+        // AAC-ELD too, and the player decodes it either way.
+        bufferStreamFormats |= 0x00002000000L; // AAC-ELD/48K/2
+      }
 
       {
         bufferStreamFormats |= 0x00000400000L; // AAC-LC/44.1K/F24/2
@@ -1375,6 +1403,94 @@ void handle_get_info(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp
   }
 }
 
+// The sample rate of a format given as a SETUP's "audioFormat": a mask with the format's bit set,
+// the bit being the format's index (see the SSRC values in player.h). 0 if unknown.
+static uint32_t ap2_rate_of_audio_format(uint64_t audio_format) {
+  uint32_t index = 0;
+  while ((audio_format > 1) && (index < 63)) {
+    audio_format >>= 1;
+    index++;
+  }
+  return (audio_format == 1) ? get_ssrc_rate((ssrc_t)(index << 24)) : 0;
+}
+
+// The sample rate of the current stream's audio: set by its SETUP, and by the stream when its
+// format changes.
+static uint32_t ap2_stream_sample_rate(rtsp_conn_info *conn) {
+  if (conn->ap2_stream_rate != 0)
+    return conn->ap2_stream_rate;
+  if (conn->input_rate != 0)
+    return conn->input_rate;
+  return 44100;
+}
+
+// A sender that packs its audio in APAP gives anchor and flush times as media times
+// (value / scale seconds) instead of RTP times: read a time either way, as an RTP time at the
+// stream's sample rate. Returns 1 if the message has it; *is_media_time (if not NULL) says which.
+static int ap2_get_rtp_time(rtsp_conn_info *conn, plist_t message, const char *rtp_key,
+                            const char *value_key, const char *scale_key, uint64_t *rtp_time,
+                            int *is_media_time, uint64_t *media_value, uint64_t *media_scale) {
+  if (is_media_time != NULL)
+    *is_media_time = 0;
+  plist_t value_item = plist_dict_get_item(message, value_key);
+  plist_t scale_item = plist_dict_get_item(message, scale_key);
+  if ((value_item != NULL) && (scale_item != NULL)) {
+    uint64_t value = 0, scale = 0;
+    plist_get_uint_val(value_item, &value);
+    plist_get_uint_val(scale_item, &scale);
+    if (scale != 0) {
+      *rtp_time = apat_media_time_to_rtp(value, scale, ap2_stream_sample_rate(conn));
+      if (is_media_time != NULL) {
+        *is_media_time = 1;
+        *media_value = value;
+        *media_scale = scale;
+      }
+      return 1;
+    }
+  }
+  plist_t item = plist_dict_get_item(message, rtp_key);
+  if (item == NULL)
+    return 0;
+  plist_get_uint_val(item, rtp_time);
+  return 1;
+}
+
+void ap2_anchor_at_rate(rtsp_conn_info *conn, uint32_t rate) {
+  int anchor_again = 0;
+  uint32_t rtp_time = 0;
+  uint64_t network_time = 0;
+  pthread_mutex_lock(&conn->flush_mutex);
+  conn->ap2_stream_rate = rate;
+  if ((conn->ap2_anchor_is_media_time != 0) && (conn->ap2_anchor_rate != rate)) {
+    rtp_time =
+        apat_media_time_to_rtp(conn->ap2_anchor_media_value, conn->ap2_anchor_media_scale, rate);
+    network_time = conn->ap2_anchor_network_time;
+    conn->ap2_anchor_rate = rate;
+    anchor_again = 1;
+  }
+  pthread_mutex_unlock(&conn->flush_mutex);
+  if (anchor_again != 0) {
+    debug(2, "Connection %d: the stream's rate is now %u: anchor at RTP time %u.",
+          conn->connection_number, rate, rtp_time);
+    set_ptp_anchor_info(conn, conn->networkTimeTimelineID, rtp_time, network_time);
+  }
+}
+
+// The audio connection a stream SETUP asks for in "streamConnections": the connection type's key,
+// "" if there is no audio connection there that we know, or NULL if there are no streamConnections.
+static const char *ap2_stream_connection_type(plist_t stream) {
+  plist_t connections = plist_dict_get_item(stream, "streamConnections");
+  if ((connections == NULL) || (plist_get_node_type(connections) != PLIST_DICT))
+    return NULL;
+  static const char *types[] = {"streamConnectionTypeAPAT", "streamConnectionTypeAPAP",
+                                "streamConnectionTypeRTP"};
+  unsigned int i;
+  for (i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+    if (plist_dict_get_item(connections, types[i]) != NULL)
+      return types[i];
+  return "";
+}
+
 void handle_flushbuffered(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
   debug(3, "Connection %d: FLUSHBUFFERED %s : Content-Length %d", conn->connection_number,
         req->path, req->contentlength);
@@ -1396,14 +1512,13 @@ void handle_flushbuffered(rtsp_conn_info *conn, rtsp_message *req, rtsp_message 
       debug(3, "flushFromSeq is %" PRId64 ".", flushFromSeq & 0x7fffff);
     }
 
-    item = plist_dict_get_item(messagePlist, "flushFromTS");
-    if (item == NULL) {
+    if (ap2_get_rtp_time(conn, messagePlist, "flushFromTS", "flushFromMediaTimeValue",
+                         "flushFromMediaTimeScale", &flushFromTS, NULL, NULL, NULL) == 0) {
       if (flushFromValid != 0)
         debug(1, "flushFromSeq without flushFromTS!");
       else
         debug(4, "Can't find a flushFromTS");
     } else {
-      plist_get_uint_val(item, &flushFromTS);
       if (flushFromValid == 0)
         debug(1, "flushFromTS without flushFromSeq!");
       debug(3, "flushFromTS is %" PRId64 ".", flushFromTS);
@@ -1417,11 +1532,10 @@ void handle_flushbuffered(rtsp_conn_info *conn, rtsp_message *req, rtsp_message 
       debug(4, "flushUntilSeq is %" PRId64 ".", flushUntilSeq & 0x7fffff);
     }
 
-    item = plist_dict_get_item(messagePlist, "flushUntilTS");
-    if (item == NULL) {
+    if (ap2_get_rtp_time(conn, messagePlist, "flushUntilTS", "flushUntilMediaTimeValue",
+                         "flushUntilMediaTimeScale", &flushUntilTS, NULL, NULL, NULL) == 0) {
       debug(1, "Can't find the flushUntilTS");
     } else {
-      plist_get_uint_val(item, &flushUntilTS);
       debug(4, "flushUntilTS is %" PRId64 ".", flushUntilTS);
     }
 
@@ -1533,12 +1647,20 @@ void handle_setrateanchori(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
 
       debug(3, "anchorTimeNanoseconds looks like %" PRIu64 ".", anchorTimeNanoseconds);
 
-      item = plist_dict_get_item(messagePlist, "rtpTime");
-      uint64_t rtpTime;
-
-      plist_get_uint_val(item, &rtpTime);
+      uint64_t rtpTime = 0, media_value = 0, media_scale = 0;
+      int is_media_time = 0;
+      ap2_get_rtp_time(conn, messagePlist, "rtpTime", "mediaTimeValue", "mediaTimeScale",
+                       &rtpTime, &is_media_time, &media_value, &media_scale);
       // debug(1, "anchor rtpTime is %" PRId64 ".", rtpTime);
       uint32_t anchorRTPTime = rtpTime;
+      // a media time is kept, to place the anchor again if the stream's sample rate changes
+      pthread_mutex_lock(&conn->flush_mutex);
+      conn->ap2_anchor_is_media_time = is_media_time;
+      conn->ap2_anchor_media_value = media_value;
+      conn->ap2_anchor_media_scale = media_scale;
+      conn->ap2_anchor_network_time = anchorTimeNanoseconds;
+      conn->ap2_anchor_rate = ap2_stream_sample_rate(conn);
+      pthread_mutex_unlock(&conn->flush_mutex);
 
       // Store the raw anchor; apply the latency offset when it is used.
       set_ptp_anchor_info(conn, conn->networkTimeTimelineID, anchorRTPTime, anchorTimeNanoseconds);
@@ -2268,12 +2390,14 @@ void handle_setpeers(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp
     plist_free(addresses_array);
   */
   // set_client_as_ptp_clock(conn);
+  follow_session_clock(conn); // the low-latency mode only
   resp->respcode = 200;
 }
 void handle_setpeersx(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
   debug(2, "Connection %d: SETPEERSX %s Content-Length %d", conn->connection_number, req->path,
         req->contentlength);
   debug_log_rtsp_message(2, "SETPEERS Xrequest", req);
+  follow_session_clock(conn); // the low-latency mode only
   resp->respcode = 200;
 }
 #endif
@@ -2746,13 +2870,36 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
             0) // it should be open already, but just in case it isn't...
           die("Can not access the NQPTP service. Has it stopped running?");
 
-        set_client_as_ptp_clock(conn);
+        if (config.airplay_2_low_latency_mode != 0)
+          follow_session_clock(conn); // once a session, normally at its SETPEERS already
+        else
+          set_client_as_ptp_clock(conn);
         ptp_send_control_message_string(
             "B"); // signify clock dependability period is "B"eginning (or continuing)
         plist_t stream0 = plist_array_get_item(streams, 0);
   
         plist_t streams_array = plist_new_array(); // to hold the ports and stuff
         plist_t stream0dict = plist_new_dict();
+        int stream_setup_failed = 0;
+
+        // An audio stream SETUP replaces a low-latency stream that is still running, and a
+        // low-latency stream, which feeds the player itself, replaces any running stream. They
+        // are stopped before anything of the new stream is set up.
+        if (config.airplay_2_low_latency_mode != 0) {
+          uint64_t new_type = 0;
+          plist_t type_item = plist_dict_get_item(stream0, "type");
+          if (type_item != NULL)
+            plist_get_uint_val(type_item, &new_type);
+          const char *new_connection_type = ap2_stream_connection_type(stream0);
+          int new_is_apat = (new_type == 103) && (new_connection_type != NULL) &&
+                            (strcmp(new_connection_type, "streamConnectionTypeAPAT") == 0);
+          if ((conn->player_thread != NULL) && (((new_type == 96) || (new_type == 103)) &&
+                                                ((conn->ap2_apat != NULL) || new_is_apat))) {
+            debug(2, "Connection %d: SETUP stops the running stream first.",
+                  conn->connection_number);
+            player_stop(conn); // the player's cleanup stops the stream's threads
+          }
+        }
   
         // get the session key -- it must have one
   
@@ -2774,6 +2921,12 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
               conn->session_key = NULL;
             }
           }
+        } else if ((config.airplay_2_low_latency_mode != 0) &&
+                   (ap2_stream_connection_type(stream0) != NULL) &&
+                   (strcmp(ap2_stream_connection_type(stream0), "streamConnectionTypeAPAT") == 0)) {
+          // the low-latency stream's keys come from the stream connection's seed instead
+          debug(3, "Connection %d: the low-latency stream SETUP has no \"shk\", as expected.",
+                conn->connection_number);
         } else {
           warn("No session key (shk) property in setup! This is fatal!");
           // This doesn't work right now. Not sure how to proceed.
@@ -2878,6 +3031,7 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
             plist_get_uint_val(item, &item_value);
             // see https://emanuelecozzi.net/docs/airplay2/audio/ for values
             conn->input_rate = item_value;
+            conn->ap2_stream_rate = item_value;
             debug(4, "Set conn->input_rate: %u.", conn->input_rate);
           } else {
             debug(1, "Connection %d. No sample rate (sr) property found in setup.",
@@ -2908,8 +3062,25 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
           named_pthread_create(&conn->rtp_realtime_audio_thread, NULL, &rtp_realtime_audio_receiver,
                                (void *)conn, "ap2_ra_%d", conn->connection_number);
           plist_dict_set_item(stream0dict, "type", plist_new_uint(96));
-          plist_dict_set_item(stream0dict, "dataPort",
-                              plist_new_uint(conn->local_realtime_audio_port));
+          if ((config.airplay_2_low_latency_mode != 0) &&
+              (ap2_stream_connection_type(stream0) != NULL)) {
+            // A sender that sees feature bit 59 (offered with the low-latency option) asks for
+            // its connections in "streamConnections", and wants their ports back there:
+            // {streamConnectionTypeRTP: {port: audio}, streamConnectionTypeRTCP: {port: control}}
+            plist_t rtp = plist_new_dict();
+            plist_dict_set_item(rtp, "streamConnectionKeyPort",
+                                plist_new_uint(conn->local_realtime_audio_port));
+            plist_t rtcp = plist_new_dict();
+            plist_dict_set_item(rtcp, "streamConnectionKeyPort",
+                                plist_new_uint(conn->local_ap2_control_port));
+            plist_t connections = plist_new_dict();
+            plist_dict_set_item(connections, "streamConnectionTypeRTP", rtp);
+            plist_dict_set_item(connections, "streamConnectionTypeRTCP", rtcp);
+            plist_dict_set_item(stream0dict, "streamConnections", connections);
+          } else {
+            plist_dict_set_item(stream0dict, "dataPort",
+                                plist_new_uint(conn->local_realtime_audio_port));
+          }
   
           debug(2, "Realtime Stream Play");
           activity_monitor_signify_activity(1);
@@ -2927,10 +3098,42 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
             plist_get_uint_val(item, &conn->audio_format);
             // see https://emanuelecozzi.net/docs/airplay2/audio/ for values
             // seems to be only the initial format -- it seems as if it can change dynamically
+            conn->ap2_stream_rate = ap2_rate_of_audio_format(conn->audio_format);
           } else {
             debug(1, "No audio format (audioFormat) property found in setup.");
           }
   
+          // A sender that sees feature bit 59 (offered with the low-latency option) names the
+          // stream's audio connection in "streamConnections": an APAT (UDP) connection for its
+          // low-latency stream, or a TCP connection carrying APAP or classic packets.
+          const char *connection_type = ap2_stream_connection_type(stream0);
+          if ((connection_type != NULL) &&
+              ((config.airplay_2_low_latency_mode == 0) || (connection_type[0] == '\0'))) {
+            debug(1, "Connection %d: SETUP asks for stream connections that aren't offered.",
+                  conn->connection_number);
+            stream_setup_failed = 1;
+            break;
+          }
+
+          if ((connection_type != NULL) &&
+              (strcmp(connection_type, "streamConnectionTypeAPAT") == 0)) {
+            // the low-latency stream: see ap2_apat.c
+            if (ap2_apat_setup(conn, stream0, stream0dict) != 0) {
+              stream_setup_failed = 1;
+              break;
+            }
+            plist_dict_set_item(stream0dict, "type", plist_new_uint(103));
+            plist_dict_set_item(stream0dict, "audioBufferSize",
+                                plist_new_uint(conn->ap2_audio_buffer_size));
+            // this should be cancelled by the SETRATEANCHORTIME that starts play
+            activity_monitor_signify_activity(0);
+            player_play(conn);
+            conn->rtp_running = 1; // hack!
+            break;
+          }
+          conn->buffered_audio_apap = (connection_type != NULL) &&
+                                      (strcmp(connection_type, "streamConnectionTypeAPAP") == 0);
+
           // bind a new TCP port and get a socket
           conn->local_buffered_audio_port = 0; // any port
           err = bind_socket_and_port(SOCK_STREAM, conn->connection_ip_family, conn->self_ip_string,
@@ -2956,8 +3159,18 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
                                              conn->connection_number);
   
           plist_dict_set_item(stream0dict, "type", plist_new_uint(103));
-          plist_dict_set_item(stream0dict, "dataPort",
-                              plist_new_uint(conn->local_buffered_audio_port));
+          if (connection_type == NULL) {
+            plist_dict_set_item(stream0dict, "dataPort",
+                                plist_new_uint(conn->local_buffered_audio_port));
+          } else {
+            // answered like the request: {streamConnections: {<type>: {streamConnectionKeyPort}}}
+            plist_t connection = plist_new_dict();
+            plist_dict_set_item(connection, "streamConnectionKeyPort",
+                                plist_new_uint(conn->local_buffered_audio_port));
+            plist_t connections = plist_new_dict();
+            plist_dict_set_item(connections, connection_type, connection);
+            plist_dict_set_item(stream0dict, "streamConnections", connections);
+          }
           plist_dict_set_item(stream0dict, "audioBufferSize",
                               plist_new_uint(conn->ap2_audio_buffer_size));
   
@@ -2977,6 +3190,19 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
           debug_log_rtsp_message(1, "Unhandled stream type incoming message", req);
         }
   
+        if (stream_setup_failed != 0) {
+          // the control thread started for this stream is stopped (its cleanup closes its port)
+          pthread_cancel(conn->rtp_ap2_control_thread);
+          pthread_join(conn->rtp_ap2_control_thread, NULL);
+          activity_monitor_signify_activity(0);
+          plist_free(stream0dict);
+          plist_free(streams_array);
+          plist_free(setupResponsePlist);
+          resp->respcode = 500;
+          plist_free(messagePlist);
+          return;
+        }
+
         plist_dict_set_item(stream0dict, "controlPort", plist_new_uint(conn->local_ap2_control_port));
   
         plist_array_append_item(streams_array, stream0dict);
@@ -4058,6 +4284,13 @@ void rtsp_conversation_thread_cleanup_function(void *arg) {
       player_stop(conn); // this nulls the player_thread and cancels the threads...
       activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
     }
+#ifdef CONFIG_AIRPLAY_2
+    ap2_apat_stop(conn); // in case the player never started; it's normally stopped with it
+    if (conn->ptp_session_timing != 0) {
+      ptp_send_control_message_string("E"); // the session's play ends (see follow_session_clock)
+      conn->ptp_session_timing = 0;
+    }
+#endif
 
     if (conn->fd > 0) {
       debug(

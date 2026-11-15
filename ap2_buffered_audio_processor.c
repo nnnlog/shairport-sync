@@ -25,6 +25,8 @@
  */
 
 #include "ap2_buffered_audio_processor.h"
+#include "ap2_apat_codec.h"
+#include "rtsp.h"
 #include "common.h"
 #include "player.h"
 #include "rtp.h"
@@ -97,6 +99,18 @@ void rtp_buffered_audio_cleanup_handler(__attribute__((unused)) void *arg) {
   debug(3, "Connection %d: closing TCP Buffered Audio port: %u.", conn->connection_number,
         conn->local_buffered_audio_port);
   debug(2, "Connection %d: rtp_buffered_audio_processor exit.", conn->connection_number);
+}
+
+// The encoding the stream's SETUP gave: its "audioFormat" is a mask with the format's bit set,
+// the bit being the format's index, the SSRC's top byte.
+static ssrc_t setup_format_ssrc(rtsp_conn_info *conn) {
+  uint64_t format = conn->audio_format;
+  uint32_t index = 0;
+  while ((format > 1) && (index < 63)) {
+    format >>= 1;
+    index++;
+  }
+  return (format == 1) ? (ssrc_t)(index << 24) : SSRC_NONE;
 }
 
 void *rtp_buffered_audio_processor(void *arg) {
@@ -177,6 +191,7 @@ void *rtp_buffered_audio_processor(void *arg) {
 
   unsigned char *payload_pointer = NULL;
   unsigned long long payload_length = 0;
+  size_t apap_frame_length = 0; // an APAP packet's frame, deciphered when it was read
   uint32_t payload_ssrc =
       SSRC_NONE; // this is the SSRC of the payload
   uint32_t previous_ssrc = SSRC_NONE;
@@ -243,22 +258,32 @@ void *rtp_buffered_audio_processor(void *arg) {
     // now, if get_next_block is non-zero, read a block. We may flush or use it
 
     if (new_audio_block_needed != 0) {
-      // a block is preceded by its length in a uint16_t
-      uint16_t data_len;
+      // a block is preceded by its length, which counts itself: a uint16_t, or a uint32_t for
+      // an APAP packet
+      size_t data_len = 0;
+      size_t length_size = (conn->buffered_audio_apap != 0) ? 4 : 2;
       // here we read from the buffer that our thread has been reading
 
       // debug(1,"read a block");
       size_t bytes_remaining_in_buffer;
-      nread =
-          read_sized_block(buffered_audio, &data_len, sizeof(data_len), &bytes_remaining_in_buffer);
-      data_len = ntohs(data_len);
+      if (length_size == 4) {
+        uint32_t data_len32 = 0;
+        nread = read_sized_block(buffered_audio, &data_len32, sizeof(data_len32),
+                                 &bytes_remaining_in_buffer);
+        data_len = ntohl(data_len32);
+      } else {
+        uint16_t data_len16 = 0;
+        nread = read_sized_block(buffered_audio, &data_len16, sizeof(data_len16),
+                                 &bytes_remaining_in_buffer);
+        data_len = ntohs(data_len16);
+      }
 
       // diagnostic
       if ((conn->ap2_audio_buffer_minimum_size < 0) ||
           (bytes_remaining_in_buffer < (size_t)conn->ap2_audio_buffer_minimum_size))
         conn->ap2_audio_buffer_minimum_size = bytes_remaining_in_buffer;
-      if (data_len >= 2) {
-        data_len = data_len - 2;
+      if (data_len >= length_size) {
+        data_len = data_len - length_size;
         if ((nread > 0) && (data_len < buffer_packet_size)) {
           // get the block itself
           // debug(1,"buffered audio packet of size %u detected.", data_len + 2);
@@ -280,14 +305,53 @@ void *rtp_buffered_audio_processor(void *arg) {
             // the Marker bit is always set, and it and the remaining 23 bits form the sequence number
   
             previous_seqno = seq_no;
-            seq_no = nctohl(&packet[0]) & 0x7FFFFF;
-  
             previous_timestamp = timestamp;
-            timestamp = nctohl(&packet[4]);
-  
             if (payload_ssrc != SSRC_NONE) // ignore intervening SSRC blocks
               previous_ssrc = payload_ssrc;
-            payload_ssrc = nctohl(&packet[8]);
+
+            if (conn->buffered_audio_apap != 0) {
+              // An APAP packet: its time, sequence number and, inside the encrypted part, the
+              // format's index (the classic SSRC's top byte). The frame is deciphered now, to
+              // where it would be deciphered when it is played.
+              apap_packet_t apap;
+              int apap_response = -2;
+              memset(m, 0, leading_free_space_length);
+              if (conn->session_key != NULL)
+                apap_response =
+                    apap_open_packet(packet, nread, conn->session_key, m + leading_free_space_length,
+                                     buffer_packet_size, &apap);
+              apap_frame_length = 0;
+              if (apap_response == 0) {
+                seq_no = apap.sequence_number & 0x7FFFFF;
+                // Extension 2 is the format's index; without it (or 0), the format is the
+                // current one, as Apple's receiver takes it (hoseSBAR_decodeAPAPExtensionItem)
+                if ((apap.body.has_format_index != 0) && (apap.body.format_index != 0))
+                  payload_ssrc = apap.body.format_index << 24;
+                else if (previous_ssrc != SSRC_NONE)
+                  payload_ssrc = previous_ssrc;
+                else
+                  payload_ssrc = setup_format_ssrc(conn);
+                uint32_t rate = get_ssrc_rate(payload_ssrc);
+                // an anchor given as a media time is placed again if the rate changes
+                if ((rate != 0) && (rate != conn->ap2_stream_rate))
+                  ap2_anchor_at_rate(conn, rate);
+                timestamp = ((rate != 0) && ((uint32_t)apap.time_scale != rate))
+                                ? apat_media_time_to_rtp((uint64_t)apap.time_value,
+                                                         (uint64_t)apap.time_scale, rate)
+                                : (uint32_t)apap.time_value;
+                // the frame follows the extensions: move it to the start of the payload area
+                memmove(m + leading_free_space_length, apap.body.frame, apap.body.frame_length);
+                apap_frame_length = apap.body.frame_length;
+              } else {
+                debug(1, "Connection %d: unusable APAP packet (%d), %zd bytes.",
+                      conn->connection_number, apap_response, nread);
+                payload_ssrc = SSRC_NONE;
+              }
+            } else {
+              seq_no = nctohl(&packet[0]) & 0x7FFFFF;
+              timestamp = nctohl(&packet[4]);
+              payload_ssrc = nctohl(&packet[8]);
+            }
             
             if ((payload_ssrc != previous_ssrc) && (payload_ssrc != SSRC_NONE)) {
 #ifdef CONFIG_METADATA
@@ -305,7 +369,7 @@ void *rtp_buffered_audio_processor(void *arg) {
             }
             
             // experimentally decode unrecognised SSRC blocks.
-            if (ssrc_is_recognised(payload_ssrc) == 0) {
+            if ((conn->buffered_audio_apap == 0) && (ssrc_is_recognised(payload_ssrc) == 0)) {
               payload_length = 0;
               unsigned long long new_payload_length = 0;
               payload_pointer = m;
@@ -601,7 +665,11 @@ void *rtp_buffered_audio_processor(void *arg) {
                 payload_pointer = m + leading_free_space_length;
                 if (lead_time >= 0) { // only decipher the packet if it's not too late
                   int response = -1;  // guess that there is a problem
-                  if (conn->session_key != NULL) {
+                  if (conn->buffered_audio_apap != 0) {
+                    // deciphered when it was read
+                    response = 0;
+                    new_payload_length = apap_frame_length;
+                  } else if (conn->session_key != NULL) {
                     unsigned char nonce[12];
                     memset(nonce, 0, sizeof(nonce));
                     memcpy(
@@ -656,8 +724,8 @@ void *rtp_buffered_audio_processor(void *arg) {
                       addADTStoPacket(payload_pointer, payload_length, conn->input_rate,
                                       channelConfiguration);
                     }
-                    int mute =
-                        ((packets_played_in_this_sequence == 0) && (ssrc_is_aac(payload_ssrc)));
+                    int mute = ((packets_played_in_this_sequence == 0) &&
+                                (ssrc_is_aac(payload_ssrc) || (payload_ssrc == AAC_ELD_48000_F24_2)));
                     if (mute) {
                       debug(2, "Connection %d: muting first AAC block -- block %u -- timestamp %u.",
                             conn->connection_number, seq_no, timestamp);
@@ -685,7 +753,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                               1000.0 * timestamp_difference / conn->input_rate,
                               first_timestamp_in_this_sequence, get_ssrc_name(payload_ssrc));
                         // mute the first packet after a discontinuity
-                        if (ssrc_is_aac(payload_ssrc)) {
+                        if (ssrc_is_aac(payload_ssrc) || (payload_ssrc == AAC_ELD_48000_F24_2)) {
                           debug(2,
                                 "Connection %d: muting first AAC block -- block %u -- following a "
                                 "timestamp discontinuity, timestamp %u.",

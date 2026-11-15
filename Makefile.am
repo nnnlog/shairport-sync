@@ -179,6 +179,7 @@ endif
 
 if USE_AIRPLAY_2
 shairport_sync_SOURCES += ap2_buffered_audio_processor.c \
+  ap2_apat.c ap2_apat_codec.c \
   ap2_event_receiver.c \
   ptp-utilities.c \
   utilities/buffered_read.c utilities/structured_buffer.c utilities/mod23.c \

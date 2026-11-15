@@ -149,6 +149,8 @@ typedef uint16_t seq_t;
 // these are the values coming in on a buffered audio RTP packet's SSRC field
 // the apparent significances are as indicated.
 // Dolby Atmos seems to be 7P1
+struct ap2_apat_session; // see ap2_apat.c
+
 typedef enum {
   SSRC_NONE = 0,
   ALAC_44100_S16_2 = 0x0000FACE, // this is made up
@@ -157,6 +159,9 @@ typedef enum {
   AAC_48000_F24_2 = 0x17000000,
   AAC_48000_F24_5P1 = 0x27000000,
   AAC_48000_F24_7P1 = 0x28000000,
+  // the low-latency stream's AAC-ELD, 480 frames per packet. Its RTP SSRC is a session value, so
+  // this code is chosen to match the others: audioFormatIndex 25 in the top byte.
+  AAC_ELD_48000_F24_2 = 0x19000000,
 } ssrc_t;
 
 typedef struct audio_buffer_entry { // decoded audio packets
@@ -332,6 +337,7 @@ typedef struct {
 
   // other stuff...
   pthread_t *player_thread;
+  int player_thread_ready; // set (atomically) once the player thread has initialised its buffers
   abuf_t audio_buffer[BUFFER_FRAMES];
   unsigned int frames_per_packet, input_num_channels, input_bit_depth, input_effective_bit_depth,
       input_rate;
@@ -460,6 +466,16 @@ typedef struct {
   pthread_t rtp_ap2_control_thread;
   pthread_t rtp_realtime_audio_thread;
   pthread_t rtp_buffered_audio_thread;
+  struct ap2_apat_session *ap2_apat; // the low-latency stream, if one is set up
+  int low_latency_stream;             // the player uses the low-latency backend buffer length
+  int ptp_session_timing; // NQPTP follows the sender's clock for the whole session (rtsp.c)
+  int buffered_audio_apap; // the buffered stream's TCP packets are APAP packets (ap2_apat_codec.h)
+  uint32_t ap2_stream_rate; // the sample rate of the stream's current format
+  // the last anchor, if it was given as a media time (by a sender packing its audio as APAP):
+  // kept so that it can be placed again when the stream's sample rate changes
+  int ap2_anchor_is_media_time;
+  uint64_t ap2_anchor_media_value, ap2_anchor_media_scale, ap2_anchor_network_time;
+  uint32_t ap2_anchor_rate;
   pthread_mutex_t event_sender_mutex;
   int event_channel_fd; // zero if closed, controlled by event_sender_mutex
 
@@ -674,6 +690,9 @@ const char *get_category_string(airplay_stream_c cat);
 int ssrc_is_recognised(ssrc_t ssrc);
 int ssrc_is_aac(ssrc_t ssrc); // used to decide if a mute might be needed (AAC only)
 void prepare_decoding_chain(rtsp_conn_info *conn, ssrc_t ssrc); // also sets up timing stuff
+// The backend buffer length the player aims for on this connection: the low-latency one while a
+// low-latency stream plays, otherwise the configured one.
+double backend_buffer_desired_length(rtsp_conn_info *conn);
 void clear_decoding_chain(rtsp_conn_info *conn);                // tear down the decoding chain
 
 #endif //_PLAYER_H

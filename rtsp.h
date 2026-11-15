@@ -42,6 +42,10 @@ ssize_t write_encrypted(int fd, pair_cipher_bundle *ctx, const void *buf, size_t
 void generateTxtDataValueInfo(rtsp_conn_info *conn, void **response, size_t *responseLength);
 plist_t generateInfoPlist(rtsp_conn_info *conn);
 char *plist_as_xml_text(plist_t the_plist); // caller must free the returned NUL-terminated string
+
+// The stream's audio format now has this sample rate: an anchor given as a media time is placed
+// again on the RTP timeline at that rate.
+void ap2_anchor_at_rate(rtsp_conn_info *conn, uint32_t rate);
 #endif
 
 #endif // _RTSP_H

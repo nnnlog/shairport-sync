@@ -1036,6 +1036,31 @@ int parse_options(int argc, char **argv) {
               str);
       }
 
+      /* Get the low-latency mode: Apple's low-latency AAC-ELD stream ("Realtime APAT"). */
+      if (config_lookup_string(config.cfg, "general.airplay_2_low_latency_mode", &str)) {
+        if (strcasecmp(str, "on") == 0)
+          config.airplay_2_low_latency_mode = 1;
+        else if (strcasecmp(str, "off") == 0)
+          config.airplay_2_low_latency_mode = 0;
+        else
+          die("Invalid \"airplay_2_low_latency_mode\" option choice \"%s\". It should be \"on\" "
+              "or \"off\"",
+              str);
+      }
+
+      /* Get the audio backend buffer length to use while a low-latency stream plays. */
+      if (config_lookup_float(config.cfg,
+                              "general.low_latency_audio_backend_buffer_desired_length_in_seconds",
+                              &dvalue)) {
+        if ((dvalue > 0.0) && (dvalue <= 0.5))
+          config.low_latency_audio_backend_buffer_desired_length = dvalue;
+        else
+          warn("Invalid low_latency_audio_backend_buffer_desired_length_in_seconds setting %f. It "
+               "must be greater than 0 and no more than 0.5 seconds. The default of %f seconds "
+               "will be used.",
+               dvalue, config.low_latency_audio_backend_buffer_desired_length);
+      }
+
       /* Get the optional volume_control_type setting. */
       if (config_lookup_int(config.cfg, "general.volume_control_type", &value)) {
         // debug(1, "Max volume setting of %f dB", dvalue);
@@ -2041,16 +2066,49 @@ int parse_options(int argc, char **argv) {
   }
 #endif
 
-  // now generate the fex field
-  uint8_t fexbytes[8];
+  if (config.airplay_2_low_latency_mode != 0) {
+    if (config.airplay_2_44100_only_mode != 0) {
+      warn("\"airplay_2_low_latency_mode\" is ignored because \"airplay_2_44100_only_mode\" is "
+           "on: the low-latency stream is 48k.");
+      config.airplay_2_low_latency_mode = 0;
+    } else {
+      // What a Mac checks before it sends its system audio as the low-latency stream ("Realtime
+      // APAT"), from its AirPlaySender (macOS 27):
+      // - bit 96 SupportsRealtimeAPAT: it uses the low-latency stream at all;
+      // - bit 92 SupportsBufferedAPAT: the stream goes out through its APAT (UDP) driver;
+      // - bit 72 SupportsBufferedAPAP: its audio engine prepares packets in the APAP format,
+      //   the only one the APAT driver takes;
+      // - bit 59 SupportsAudioStreamConnectionSetup: the stream SETUP negotiates its connections
+      //   in "streamConnections", which is how the UDP connection is set up.
+      // Its anchor time then comes as an RTSP SETRATEANCHORTIME. The low-latency stream uses
+      // AAC-ELD/48000/2, offered in /info as a bufferStream format.
+      // Bits 59 and 72 change ordinary buffered streams too: they also negotiate their TCP
+      // connection in "streamConnections", in the APAP packet format, with media-time anchors.
+      config.airplay_features |= ((uint64_t)1 << 59);
+      config.airplay_features_ex |= ((uint64_t)1 << (72 - 64)) | ((uint64_t)1 << (92 - 64)) |
+                                    ((uint64_t)1 << (96 - 64));
+    }
+  }
+
+  // now generate the fex field: the feature bits in little-endian form, without trailing zero
+  // bytes beyond the first eight. Bits 64 and up are advertised only here.
+  uint8_t fexbytes[16];
   uint64_t temp = config.airplay_features;
   debug(4, "airplay_features are %" PRIx64 ".", temp);
   for (i = 0; i < 8; i++) {
     fexbytes[i] = temp & 0xff;
     temp = temp >> 8;
   }
+  temp = config.airplay_features_ex;
+  for (i = 8; i < 16; i++) {
+    fexbytes[i] = temp & 0xff;
+    temp = temp >> 8;
+  }
+  size_t fex_length = sizeof(fexbytes);
+  while ((fex_length > 8) && (fexbytes[fex_length - 1] == 0))
+    fex_length--;
 
-  config.airplay_fex = base64_enc(fexbytes, 8);
+  config.airplay_fex = base64_enc(fexbytes, fex_length);
   if (config.airplay_fex == NULL)
     die("could not allocate memory for \"airplay_fex\"");
   // strip the padding.
@@ -2189,6 +2247,11 @@ int parse_options(int argc, char **argv) {
 #else
   // if we don't have AirPLay 2, the service type must be classic
   config.service_type = APST_classic;
+#endif
+
+#ifdef CONFIG_AIRPLAY_2
+  if ((config.airplay_2_low_latency_mode != 0) && (config.service_type != APST_airplay2))
+    config.airplay_2_low_latency_mode = 0; // it's an AirPlay 2 feature
 #endif
 
   config.service_name = service_name(raw_service_name);
@@ -2756,6 +2819,9 @@ int main(int argc, char **argv) {
 #ifdef CONFIG_AIRPLAY_2
   config.get_plist_metadata = 1; // default to using AirPlay-2-type plist information
   config.lossless_mode = 1;
+  // the low-latency stream arrives about 55 ms ahead of its play time at best, so the backend
+  // buffer must be well short of that while it plays
+  config.low_latency_audio_backend_buffer_desired_length = 0.03;
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(53, 10, 0)
   avcodec_init();
 #endif
@@ -3540,6 +3606,13 @@ int main(int argc, char **argv) {
   //   debug(option_print_level, "output_rate is %d.", config.current_output_configuration->rate);
   debug(option_print_level, "audio backend desired buffer length is %f seconds.",
         config.audio_backend_buffer_desired_length);
+#ifdef CONFIG_AIRPLAY_2
+  debug(option_print_level, "airplay_2_low_latency_mode is \"%s\".",
+        config.airplay_2_low_latency_mode ? "on" : "off");
+  debug(option_print_level,
+        "audio backend desired buffer length for a low-latency stream is %f seconds.",
+        config.low_latency_audio_backend_buffer_desired_length);
+#endif
   debug(option_print_level,
         "audio_backend_buffer_interpolation_threshold_in_seconds is %f seconds.",
         config.audio_backend_buffer_interpolation_threshold_in_seconds);
